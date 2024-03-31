@@ -1,36 +1,7 @@
-//
-// Comment out USE_SINGLE_FLOATINGPOINT_WITH_CUDA when "double" is used for CUDA
-//
-// #define USE_SINGLE_FLOATINGPOINT_WITH_CUDA
+#include "PrincipalComponentAnalysis.h"
 
-#ifdef USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-using data_type = float;
-#else // USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-using data_type = double;
-#endif // USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-
-#define DLLEXPORT extern "C" __declspec(dllexport)
-
-#include <iostream>
-#include <cmath>
-#include <functional>
-#include <iostream>
-#include <random>
-#include <stdexcept>
-#include <string>
-
-#include <cstdio>
-#include <cstdlib>
-#include <vector>
-
-#include <cublas_v2.h>
-#include <cuda_runtime.h>
-#include <cusolverDn.h>
-
-#include <cuComplex.h>
-#include <cuda_runtime_api.h>
-#include <cublas_api.h>
-#include <library_types.h>
+using namespace std;
+using namespace Eigen;
 
 // CUDA API error checking
 #define CUDA_CHECK(err)                                                                            \
@@ -62,130 +33,112 @@ using data_type = double;
         }                                                                                          \
     } while (0)
 
-#include <Eigen/Core>
-#include <Eigen/Eigenvalues>
 
-using namespace std;
-using namespace Eigen;
+template <typename T>
+struct linear_index_to_row_index : public thrust::unary_function<T,T> {
+    T rows; // --- Number of rows
+    __host__ __device__ linear_index_to_row_index(T rows) : rows(rows) {}
+    __host__ __device__ T operator()(T i) { return i % rows; }
+};
+
 
 /**
- * Compute Eigendecomposition of a symmetric matrix with CUDA
+ * Calculate Principal Component Analysis with cuBLAS and cuSOLVER (CUDA implementation)
  *
- *   - Since m_symmetric_in stores values of a symmetric matrix,
- *     it is not affected by the difference between column-major and row-major.
- *   - m_array_eigenvectors_out are storead in column-major order,
- *     since cuSOLVER expects dense matrices are assumed to be stored in column-major order in memory.
+ *   - Since cuBLAS and cuSOLVER matrix is column-major, m_array_input's rows and columns are swapped from C# interface
  *
- * @param m_symmetric_in  Pointer to an input symmetric matrix values
- * @param columns  Number of columns (or rows) of an input symmetric matrix
- * @param v_array_eigenvalues_out  Pointer to output eigenvalues
- * @param m_array_eigenvectors_out  Pointer to output eigenvectors
- * @param cudaDataType  Type of data (this function supports CUDA_R_32F and CUDA_R_64F only)
+ * @param m_array_input  Pointer to an input matrix values (length: rows * columns): column-major matrix (M_input)
+ * @param columns  Number of columns of an input matrix: Number of sample vectors
+ * @param rows  Number of rows of an input matrix: Size of sample vector
+ * @param v_array_mean_out  Pointer to an output mean vector (length: rows): Mean of sample vectors
+ * @param m_array_cov_out  Pointer to an output covariance martix (length: rows * rows): Covariance matrix of sample vectors
+ * @param v_array_eigenvalues_out  Pointer to an output eigenvalues vector (length: rows): Eigenvalues of covariance matrix
+ * @param m_array_eigenvectors_out  Pointer to an output eigenvectors martix (length: rows * rows): Eigenvectors of covariance matrix (row-major)
  */
-void eigendecomposition_with_cuda(const data_type* m_symmetric_in,
-                                  const int columns,
-                                  data_type* v_array_eigenvalues_out,
-                                  data_type* m_array_eigenvectors_out,
-                                  cudaDataType_t cudaDataType)
+void solve_principal_component_analysis_with_cuda(const double* m_array_input,
+                                                  const int columns,
+                                                  const int rows,
+                                                  double* v_array_mean_out,
+                                                  double* m_array_cov_out,
+                                                  double* v_array_eigenvalues_out,
+                                                  double* m_array_eigenvectors_out)
 {
-    cusolverDnHandle_t cusolverH = NULL;
+    cublasHandle_t cublasH = NULL;
     cudaStream_t stream = NULL;
-    cusolverDnParams_t params = NULL;
 
-    data_type *d_M_cov = nullptr; // device pointer for covariance matrix
-    int size_of_matrix = columns * columns; // size of covariance and eigenvectors matrix
-    
-    data_type *d_V_lambda = nullptr; // device pointer for eigenvalues vector
-    int size_of_vector = columns; // size of eigenvalues vector
-
-    int *d_info = nullptr;
-    int info = 0;
-
-    size_t workspaceInBytesOnDevice = 0; /* size of workspace */
-    void *d_work = nullptr;              /* device workspace */
-    size_t workspaceInBytesOnHost = 0;   /* size of workspace */
-    void *h_work = nullptr;              /* host workspace */
-
-    // step 1: create cusolver handle, bind a stream
-    CUSOLVER_CHECK(cusolverDnCreate(&cusolverH));
-
+    // Create cublas handle, bind a stream
+    CUBLAS_CHECK(cublasCreate(&cublasH));
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    CUSOLVER_CHECK(cusolverDnSetStream(cusolverH, stream));
-    CUSOLVER_CHECK(cusolverDnCreateParams(&params));
+    CUBLAS_CHECK(cublasSetStream(cublasH, stream));
 
-    // step 2: allocate device memory and copy matrix data
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_M_cov), sizeof(data_type) * size_of_matrix));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_V_lambda), sizeof(data_type) * size_of_vector));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_info), sizeof(int)));
+    thrust::device_vector<double> d_M_input(rows * columns); // M_input
+    thrust::device_vector<double> d_V_ones(columns, 1.f);    // V_ones = [1, ..., 1]^t
+    thrust::device_vector<double> d_V_mean(rows);            // V_mean =  1 / columns * M_input * [1, ..., 1]^t
+    thrust::device_vector<double> d_M_cov(rows * rows);      // M_cov = A * A^t (A = M_input - [V_mean, ..., V_mean])
+    thrust::device_vector<double> d_M_eingenvectors_row_major(rows * rows);  // Eigenvectors of M_cov (row-major matrix)
 
-    CUDA_CHECK(cudaMemcpyAsync(d_M_cov, m_symmetric_in, sizeof(data_type) * size_of_matrix, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(thrust::raw_pointer_cast(d_M_input.data()), m_array_input, sizeof(double) * rows * columns,
+                               cudaMemcpyHostToDevice, stream));
 
-    // step 3: query working space of syevd
-    cusolverEigMode_t jobz = CUSOLVER_EIG_MODE_VECTOR; // compute eigenvalues and eigenvectors
-    cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER; // lower triangle of d_M_cov is stored
+#ifdef __ENABLE_CONSOLE_TEST_CODES__
+    std::cout << "M_input: " << d_M_input[0] << ", ..., " << d_M_input[(columns - 1) * rows] << std::endl;
+    std::cout << "M_input: " << "......" << std::endl;
+    std::cout << "M_input: " << d_M_input[rows - 1] << ", ..., " << d_M_input[rows * columns - 1] << std::endl << std::endl;
+#endif
+    
+    // -------------------------------------------------------------------------------------------
+    // Calculation of Mean Vector: V_mean = 1 / columns * M_input * [1, ..., 1]^t
+    // -------------------------------------------------------------------------------------------
+    double alpha = 1.0 / columns;
+    double beta = 0.0;
+    CUBLAS_CHECK(cublasDgemv(cublasH, CUBLAS_OP_N, rows, columns, &alpha, thrust::raw_pointer_cast(d_M_input.data()), rows, 
+                             thrust::raw_pointer_cast(d_V_ones.data()), 1, &beta, thrust::raw_pointer_cast(d_V_mean.data()), 1));
 
-    CUSOLVER_CHECK(cusolverDnXsyevd_bufferSize(cusolverH, params, jobz, uplo, size_of_vector, cudaDataType, d_M_cov, size_of_vector,
-                                               cudaDataType, d_V_lambda, cudaDataType, &workspaceInBytesOnDevice, &workspaceInBytesOnHost));
+#ifdef __ENABLE_CONSOLE_TEST_CODES__    
+    std::cout << "V_mean: " << d_V_mean[0] << ", ..., " << d_V_mean[rows - 1] << std::endl << std::endl;
+#endif
+    
+    // -------------------------------------------------------------------------------------------
+    // Subtract mean colum vector from input Matrix columns: A = M_input - [V_mean, ..., V_mean]
+    // -------------------------------------------------------------------------------------------
+    thrust::transform(d_M_input.begin(), d_M_input.end(),
+                      thrust::make_permutation_iterator(d_V_mean.begin(),
+                                                        thrust::make_transform_iterator(thrust::make_counting_iterator(0),
+                                                                                        linear_index_to_row_index<int>(rows))),
+                      d_M_input.begin(),
+                      thrust::minus<double>());
 
-    std::printf("cusolverDnXsyevd_bufferSize: workspaceInBytesOnDevice = %zu\n", workspaceInBytesOnDevice);
-    std::printf("cusolverDnXsyevd_bufferSize: workspaceInBytesOnHost = %zu\n", workspaceInBytesOnHost);
+#ifdef __ENABLE_CONSOLE_TEST_CODES__
+    std::cout << "M_input - V_mean: " << d_M_input[0] << ", ..., " << d_M_input[(columns - 1) * rows] << std::endl;
+    std::cout << "M_input - V_mean: " << "......" << std::endl;
+    std::cout << "M_input - V_mean: " << d_M_input[rows - 1] << ", ..., " << d_M_input[rows * columns - 1] << std::endl << std::endl;
+#endif
+    
+    // -------------------------------------------------------------------------------------------
+    // Calculation of Covariance Matrix: M_cov = A * A^t (A = M_input - [V_mean, ..., V_mean])
+    // -------------------------------------------------------------------------------------------
+    alpha = 1.0;
+    beta = 0.0;
+    CUBLAS_CHECK(cublasDgemm(cublasH, CUBLAS_OP_N, CUBLAS_OP_T, rows, rows, columns, &alpha,
+                             thrust::raw_pointer_cast(d_M_input.data()), rows,
+                             thrust::raw_pointer_cast(d_M_input.data()), rows, &beta,
+                             thrust::raw_pointer_cast(d_M_cov.data()), rows));
 
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_work), workspaceInBytesOnDevice));
-
-    if (workspaceInBytesOnHost > 0) {
-        h_work = reinterpret_cast<void *>(malloc(workspaceInBytesOnHost));
-        if (h_work == nullptr) {
-            throw std::runtime_error("Error: h_work not allocated.");
-        }
-    }
-
-    // step 4: compute eigendecomposition
-    CUSOLVER_CHECK(cusolverDnXsyevd(cusolverH, params, jobz, uplo, size_of_vector, cudaDataType, d_M_cov, size_of_vector, cudaDataType, d_V_lambda,
-                                    cudaDataType, d_work, workspaceInBytesOnDevice, h_work,  workspaceInBytesOnHost, d_info));
-
-    CUDA_CHECK(cudaMemcpyAsync(m_array_eigenvectors_out, d_M_cov, sizeof(data_type) * size_of_matrix, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(v_array_eigenvalues_out, d_V_lambda, sizeof(data_type) * size_of_vector, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(&info, d_info, sizeof(int), cudaMemcpyDeviceToHost, stream));
-
+    // Copy data to host
+    CUDA_CHECK(cudaMemcpyAsync(v_array_mean_out, thrust::raw_pointer_cast(d_V_mean.data()), sizeof(double) * rows,
+                               cudaMemcpyDeviceToHost, stream));    
+    CUDA_CHECK(cudaMemcpyAsync(m_array_cov_out, thrust::raw_pointer_cast(d_M_cov.data()), sizeof(double) * rows * rows,
+                               cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    std::printf("after Xsyevd: info = %d\n", info);
-    if (0 > info) {
-        std::printf("%d-th parameter is wrong \n", -info);
-        exit(1);
-    }
-
-    // free resources
-    CUDA_CHECK(cudaFree(d_M_cov));
-    CUDA_CHECK(cudaFree(d_V_lambda));
-    CUDA_CHECK(cudaFree(d_info));
-    CUDA_CHECK(cudaFree(d_work));
-    free(h_work);
-
-    CUSOLVER_CHECK(cusolverDnDestroy(cusolverH));
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    CUDA_CHECK(cudaDeviceReset());
-
-    std::printf("\n");
-}
-
-/*
-void eigendecomposition_with_cuda(const double* m_symmetric_in,
-                                  const int columns,
-                                  double* v_array_eigenvalues_out,
-                                  double* m_array_eigenvectors_out)
-{
+    
+    // ---------------------------------------------------------------
+    // Eigendecomposition of a covariance matrix
+    // ---------------------------------------------------------------
     cusolverDnHandle_t cusolverH = NULL;
-    cudaStream_t stream = NULL;
     cusolverDnParams_t params = NULL;
 
-    double *d_M_cov = nullptr; // device pointer for covariance matrix
-    int size_of_matrix = columns * columns; // size of covariance and eigenvectors matrix
-    
-    double *d_V_lambda = nullptr; // device pointer for eigenvalues vector
-    int size_of_vector = columns; // size of eigenvalues vector
-
-    int *d_info = nullptr;
+    thrust::device_vector<double> d_V_eigenvalues(rows);
+    thrust::device_vector<int> d_info(1);
     int info = 0;
 
     size_t workspaceInBytesOnDevice = 0; // size of workspace
@@ -193,29 +146,23 @@ void eigendecomposition_with_cuda(const double* m_symmetric_in,
     size_t workspaceInBytesOnHost = 0;   // size of workspace
     void *h_work = nullptr;              // host workspace
 
-    // step 1: create cusolver handle, bind a stream
+    // Create cusolver handle, bind a stream
     CUSOLVER_CHECK(cusolverDnCreate(&cusolverH));
-
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     CUSOLVER_CHECK(cusolverDnSetStream(cusolverH, stream));
     CUSOLVER_CHECK(cusolverDnCreateParams(&params));
 
-    // step 2: allocate device memory and copy matrix data
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_M_cov), sizeof(double) * size_of_matrix));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_V_lambda), sizeof(double) * size_of_vector));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_info), sizeof(int)));
+    // Query working space of syevd
+    cusolverEigMode_t jobz = CUSOLVER_EIG_MODE_VECTOR; // Compute eigenvalues and eigenvectors
+    cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER; // Lower triangle of d_M_cov is stored
+    
+    CUSOLVER_CHECK(cusolverDnXsyevd_bufferSize(cusolverH, params, jobz, uplo, rows, CUDA_R_64F, thrust::raw_pointer_cast(d_M_cov.data()), rows,
+                                               CUDA_R_64F, thrust::raw_pointer_cast(d_V_eigenvalues.data()), CUDA_R_64F,
+                                               &workspaceInBytesOnDevice, &workspaceInBytesOnHost));
 
-    CUDA_CHECK(cudaMemcpyAsync(d_M_cov, m_symmetric_in, sizeof(double) * size_of_matrix, cudaMemcpyHostToDevice, stream));
-
-    // step 3: query working space of syevd
-    cusolverEigMode_t jobz = CUSOLVER_EIG_MODE_VECTOR; // compute eigenvalues and eigenvectors
-    cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER; // lower triangle of d_M_cov is stored
-
-    CUSOLVER_CHECK(cusolverDnXsyevd_bufferSize(cusolverH, params, jobz, uplo, size_of_vector, CUDA_R_64F, d_M_cov, size_of_vector,
-                                               CUDA_R_64F, d_V_lambda, CUDA_R_64F, &workspaceInBytesOnDevice, &workspaceInBytesOnHost));
-
+#ifdef __ENABLE_CONSOLE_TEST_CODES__
     std::printf("cusolverDnXsyevd_bufferSize: workspaceInBytesOnDevice = %zu\n", workspaceInBytesOnDevice);
     std::printf("cusolverDnXsyevd_bufferSize: workspaceInBytesOnHost = %zu\n", workspaceInBytesOnHost);
+#endif
 
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_work), workspaceInBytesOnDevice));
 
@@ -226,300 +173,68 @@ void eigendecomposition_with_cuda(const double* m_symmetric_in,
         }
     }
 
-    // step 4: compute eigendecomposition
-    CUSOLVER_CHECK(cusolverDnXsyevd(cusolverH, params, jobz, uplo, size_of_vector, CUDA_R_64F, d_M_cov, size_of_vector,
-                                    CUDA_R_64F, d_V_lambda, CUDA_R_64F, d_work, workspaceInBytesOnDevice, h_work, workspaceInBytesOnHost, d_info));
+    // Compute eigendecomposition
+    CUSOLVER_CHECK(cusolverDnXsyevd(cusolverH, params, jobz, uplo, rows, CUDA_R_64F,
+                                    thrust::raw_pointer_cast(d_M_cov.data()), rows, CUDA_R_64F,
+                                    thrust::raw_pointer_cast(d_V_eigenvalues.data()), CUDA_R_64F, d_work, workspaceInBytesOnDevice,
+                                    h_work, workspaceInBytesOnHost, thrust::raw_pointer_cast(d_info.data())));
 
-    CUDA_CHECK(cudaMemcpyAsync(m_array_eigenvectors_out, d_M_cov, sizeof(double) * size_of_matrix, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(v_array_eigenvalues_out, d_V_lambda, sizeof(double) * size_of_vector, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(&info, d_info, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    // Apply thrust::reverse() to make the order of eigenvalues decreasing order
+    thrust::reverse(d_V_eigenvalues.begin(), d_V_eigenvalues.end());
 
+    // Since the order of eigenvalues is reversed,
+    // reverse the column order of eigenvectors matrix (column-major matrix)
+    int m_eigenvectors_size = rows * rows;
+    int m_eigenvectors_rows = rows;
+    int m_eigenvectors_columns = rows;    
+    double *d_M_eigenvectors_ptr = (double *)thrust::raw_pointer_cast(d_M_cov.data());
+    auto counting = thrust::make_counting_iterator<int>(0);
+    thrust::for_each(thrust::cuda::par.on(stream), counting,
+                     counting + (m_eigenvectors_size / 2), [=] __device__(int idx) {
+                       int dest_row = idx % m_eigenvectors_rows;
+                       int dest_col = idx / m_eigenvectors_rows;
+                       int src_row = dest_row;
+                       int src_col = (m_eigenvectors_columns - dest_col) - 1;
+                       int src_idx = src_col * m_eigenvectors_rows + src_row;
+                       double temp = d_M_eigenvectors_ptr[idx];
+                       d_M_eigenvectors_ptr[idx] = d_M_eigenvectors_ptr[src_idx];
+                       d_M_eigenvectors_ptr[src_idx] = temp;
+                     });
+
+    // Make the order of eigenvectors matrix (column-major matrix) row-major matrix : Transpose
+    alpha = 1.0;
+    beta = 0.0;
+    CUBLAS_CHECK(cublasDgeam(cublasH, CUBLAS_OP_T, CUBLAS_OP_N, rows, rows, &alpha,
+                             d_M_eigenvectors_ptr, rows, &beta,
+                             d_M_eigenvectors_ptr, rows,
+                             thrust::raw_pointer_cast(d_M_eingenvectors_row_major.data()), rows));
+
+    CUDA_CHECK(cudaMemcpyAsync(m_array_eigenvectors_out, thrust::raw_pointer_cast(d_M_eingenvectors_row_major.data()),
+                               sizeof(double) * rows * rows,
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(v_array_eigenvalues_out, thrust::raw_pointer_cast(d_V_eigenvalues.data()), sizeof(double) * rows,
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(&info, thrust::raw_pointer_cast(d_info.data()), sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
+#ifdef __ENABLE_CONSOLE_TEST_CODES__
     std::printf("after Xsyevd: info = %d\n", info);
+#endif
+    
     if (0 > info) {
         std::printf("%d-th parameter is wrong \n", -info);
         exit(1);
     }
 
+#ifdef __ENABLE_CONSOLE_TEST_CODES__    
+    std::printf("\n\n");
+#endif
+    
     // free resources
-    CUDA_CHECK(cudaFree(d_M_cov));
-    CUDA_CHECK(cudaFree(d_V_lambda));
-    CUDA_CHECK(cudaFree(d_info));
     CUDA_CHECK(cudaFree(d_work));
     free(h_work);
 
+    CUBLAS_CHECK(cublasDestroy(cublasH));
     CUSOLVER_CHECK(cusolverDnDestroy(cusolverH));
     CUDA_CHECK(cudaStreamDestroy(stream));
-    CUDA_CHECK(cudaDeviceReset());
-
-    std::printf("\n\n");
-}
-*/
-
-/**
- * Performs the matrix-matrix multiplication with cuBLAS
- *
- * @param m_array_in  Pointer to an input matrix values (length: rows * columns): A
- * @param rows  Number of rows of an input matrix: Number of samples
- * @param columns  Number of columns of an input matrix: Size of sample data
- * @param m_array_out  Pointer to an output matrix values (length: columns * columns): A^t * A
- */
-void matrix_multiplication_with_cuda(const data_type* m_array_in,
-                                     const int rows,
-                                     const int columns,
-                                     data_type* m_array_out)
-{
-    cublasHandle_t cublasH = NULL;
-    cudaStream_t stream = NULL;
-
-    const data_type alpha = 1.0;
-    const data_type beta = 0.0;
-
-    data_type *d_A = nullptr;  // A
-    data_type *d_X = nullptr;  // X = A^t * A
-
-    // step 1: create cublas handle, bind a stream
-    CUBLAS_CHECK(cublasCreate(&cublasH));
-
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    CUBLAS_CHECK(cublasSetStream(cublasH, stream));
-
-    // step 2: copy data to device
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_A), sizeof(data_type) * rows * columns));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_X), sizeof(data_type) * columns * columns));
-
-    CUDA_CHECK(cudaMemcpyAsync(d_A, m_array_in, sizeof(data_type) * rows * columns, cudaMemcpyHostToDevice, stream));
-
-    // step 3: compute: X = A^t * A
-#ifdef USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-    CUBLAS_CHECK(cublasSgemm(cublasH, CUBLAS_OP_T, CUBLAS_OP_N, columns, columns, rows, &alpha, d_A, rows, d_A, rows, &beta, d_X, columns));
-#else //  USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-    CUBLAS_CHECK(cublasDgemm(cublasH, CUBLAS_OP_T, CUBLAS_OP_N, columns, columns, rows, &alpha, d_A, rows, d_A, rows, &beta, d_X, columns));    
-#endif //  USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-    
-    // step 4: copy data to host
-    CUDA_CHECK(cudaMemcpyAsync(m_array_out, d_X, sizeof(data_type) * columns * columns, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    
-    // free resources
-    CUDA_CHECK(cudaFree(d_A));
-    CUDA_CHECK(cudaFree(d_X));
-
-    CUBLAS_CHECK(cublasDestroy(cublasH));
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    CUDA_CHECK(cudaDeviceReset());
-}
-
-/*
-void matrix_multiplication_with_cuda(const double* m_array_in,
-                                     const int rows,
-                                     const int columns,
-                                     double* m_array_out)
-{
-    cublasHandle_t cublasH = NULL;
-    cudaStream_t stream = NULL;
-
-    const double alpha = 1.0;
-    const double beta = 0.0;
-
-    double *d_A = nullptr;  // A
-    double *d_X = nullptr;  // X = A^t * A
-
-    // step 1: create cublas handle, bind a stream
-    CUBLAS_CHECK(cublasCreate(&cublasH));
-
-    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    CUBLAS_CHECK(cublasSetStream(cublasH, stream));
-
-    // step 2: copy data to device
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_A), sizeof(double) * rows * columns));
-    CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&d_X), sizeof(double) * columns * columns));
-
-    CUDA_CHECK(cudaMemcpyAsync(d_A, m_array_in, sizeof(double) * rows * columns, cudaMemcpyHostToDevice, stream));
-
-    // step 3: compute: X = A^t * A
-    CUBLAS_CHECK(cublasDgemm(cublasH, CUBLAS_OP_T, CUBLAS_OP_N, columns, columns, rows, &alpha, d_A, rows, d_A, rows, &beta, d_X, columns));
-
-    // step 4: copy data to host
-    CUDA_CHECK(cudaMemcpyAsync(m_array_out, d_X, sizeof(double) * columns * columns, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-    
-    // free resources
-    CUDA_CHECK(cudaFree(d_A));
-    CUDA_CHECK(cudaFree(d_X));
-
-    CUBLAS_CHECK(cublasDestroy(cublasH));
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    CUDA_CHECK(cudaDeviceReset());
-}
-*/
-
-
-DLLEXPORT void solve_principal_component_analysis(double* m_array_input,
-                                                  const int rows,
-                                                  const int columns,
-                                                  double* v_array_mean_out,
-                                                  double* m_array_cov_out,
-                                                  double* v_array_eigenvalues_out,
-                                                  double* m_array_eigenvectors_out)
-{
-    cout << "--- C++ codes (START) ---" << endl;
-    cout << "--- solve_principal_component_analysis (START) ---" << endl;
-
-    // Map m_array_input to MatrixXd
-    // rows: Number of sample row vectors
-    // columns: Size of sample row vectors
-    // - Make memory array row-major to map m_array_input (Eigen's default order is column-major)
-    // - C# two dimensional array double[,] is row-major
-    Map<Matrix<double, Dynamic, Dynamic, RowMajor>> m_input(m_array_input, rows, columns);
-
-    cout << "m_input is prepared." << endl;
-
-    // ---------------------------------------------------------------
-    // Calculation of Covariance Matrix
-    // ---------------------------------------------------------------
-
-    // Map v_array_mean_out to VectorXd
-    // - The size of mean vector is columns
-    Map<VectorXd> v_mean(v_array_mean_out, columns);
-
-    // Calculate the mean of sample row vectors
-    v_mean = m_input.colwise().mean();
-
-    cout << "v_mean" << endl;
-    cout << v_mean(0) << ", ..., " << v_mean(columns - 1) << endl << endl;    
-    
-    // Subtract v_mean.transpose() from each sample row vector
-    m_input = m_input.rowwise() - v_mean.transpose();
-
-#ifdef USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-    
-    // 1. Convert double array to float array to make calculation faster and reduce memory usage for GPGPU.
-    // 2. Convert array order from row-major to column-major for cuBLAS
-    float* m_array_input_float = new float[rows * columns];
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < columns; j++) {
-            // row-major to column-major
-            m_array_input_float[j * rows + i] = (float) m_array_input[i * columns + j];
-        }
-    }
-    
-    float* m_array_cov_float = new float[columns * columns];
-    matrix_multiplication_with_cuda(m_array_input_float, rows, columns, m_array_cov_float);
-
-#else // USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-
-    // Convert array order from row-major to column-major for cuBLAS
-    double* m_array_input_column_major = new double[rows * columns];
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < columns; j++) {
-            // row-major to column-major
-            m_array_input_column_major[j * rows + i] = m_array_input[i * columns + j];
-        }
-    }
-    std::memcpy(m_array_input, m_array_input_column_major, sizeof(double) * rows * columns);
-    delete[] m_array_input_column_major;
-    matrix_multiplication_with_cuda(m_array_input, rows, columns, m_array_cov_out);
-    
-#endif // USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-
-    
-    // ---------------------------------------------------------------
-    // Eigendecomposition of a covariance matrix
-    // ---------------------------------------------------------------
-    
-#ifdef USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-    
-    // Convert double array to float array to make calculation faster and reduce memory usage for GPGPU.
-    float* v_array_eigenvalues_float = new float[columns];
-    float* m_array_eigenvectors_float = new float[columns * columns];
-    
-    eigendecomposition_with_cuda(m_array_cov_float, columns, v_array_eigenvalues_float, m_array_eigenvectors_float, CUDA_R_32F);
-
-    for (int i = 0; i < columns; i++) {
-        v_array_eigenvalues_out[i] = v_array_eigenvalues_float[i];
-    }
-    
-    for (int i = 0; i < columns; i++) {
-        for (int j = 0; j < columns; j++) {
-            m_array_cov_out[i * columns + j] = m_array_cov_float[i * columns + j];
-            m_array_eigenvectors_out[i * columns + j] = m_array_eigenvectors_float[i * columns + j];
-        }
-    }
-
-#else // USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-
-    eigendecomposition_with_cuda(m_array_cov_out, columns, v_array_eigenvalues_out, m_array_eigenvectors_out, CUDA_R_64F);
-    
-#endif // USE_SINGLE_FLOATINGPOINT_WITH_CUDA
-
-    // Map v_array_eigenvalues_out to VectorXd
-    Map<VectorXd> eigenvalues(v_array_eigenvalues_out, columns);
-    // Apply reverse() to make the order of eigenvalues decreasing order
-    eigenvalues = eigenvalues.reverse().eval();
-
-    // Map m_array_eigenvectors_out to MatrixXd
-    // - Both cuSOLVER and Eigen expects dense matrices are stored in column-major order in memory.
-    //   So, m_array_eigenvectors_out is mapped with Eigen's default mapping.
-    // - eigenvectors matrix is transposed at the end of this function to make the order of m_array_eigenvectors_out row-major
-    Map<MatrixXd> eigenvectors(m_array_eigenvectors_out, columns, columns);
-
-    // Apply reverse() to eigenvectors since the order of eigenvalues are reversed
-    eigenvectors = eigenvectors.rowwise().reverse().eval();
-
-    // ---------------------------------------------------------------
-    // Test codes (Start)
-    // ---------------------------------------------------------------
-    // Map m_array_cov_out to MatrixXd
-    // - The size of rows are the same as the input columns
-    // - Since m_array_cov_out stores values of a symmetric matrix,
-    //   it is not affected by the difference between column-major and row-major.
-    Map<MatrixXd> m_cov(m_array_cov_out, columns, columns);
-
-    cout << "m_cov is prepared." << endl;
-    cout << m_cov(0, 0) << ", ..., " << m_cov(0, columns - 1) << endl;
-    cout << "..." << endl;    
-    cout << m_cov(columns - 1, 0) << ", ..., " << m_cov(columns - 1, columns - 1) << endl << endl;
-    
-    cout << "eigenvalues" << endl;
-    cout << eigenvalues(0) << ", ..., " << eigenvalues(columns - 1) << endl << endl;
-
-    cout << "eigenvectors" << endl;
-    cout << eigenvectors(0, 0) << ", ..., " << eigenvectors(0, columns - 1) << endl;
-    cout << "..." << endl;    
-    cout << eigenvectors(columns - 1, 0) << ", ..., " << eigenvectors(columns - 1, columns - 1) << endl << endl;
-
-    MatrixXd M_cov_V = m_cov * eigenvectors;
-    cout << "Check Result: M_cov * V" << endl;
-    cout << M_cov_V(0, 0) << ", ..., " << M_cov_V(0, columns - 1) << endl;
-    cout << "..." << endl;    
-    cout << M_cov_V(columns - 1, 0) << ", ..., " << M_cov_V(columns - 1, columns - 1) << endl << endl;
-
-    MatrixXd V_L = eigenvectors * eigenvalues.asDiagonal();
-    cout << "Check Result: V * L" << endl;
-    cout << V_L(0, 0) << ", ..., " << V_L(0, columns - 1) << endl;
-    cout << "..." << endl;    
-    cout << V_L(columns - 1, 0) << ", ..., " << V_L(columns - 1, columns - 1) << endl << endl;
-
-    MatrixXd VVt = eigenvectors * eigenvectors.transpose();
-    cout << "Check Result: V V^t" << endl;
-    cout << VVt(0, 0) << ", ..., " << VVt(0, columns - 1) << endl;
-    cout << "..." << endl;    
-    cout << VVt(columns - 1, 0) << ", ..., " << VVt(columns - 1, columns - 1) << endl << endl;
-    
-    MatrixXd VLVt = eigenvectors * eigenvalues.asDiagonal() * eigenvectors.transpose();
-    cout << "Check Result: V L V^t" << endl;
-    cout << VLVt(0, 0) << ", ..., " << VLVt(0, columns - 1) << endl;
-    cout << "..." << endl;    
-    cout << VLVt(columns - 1, 0) << ", ..., " << VLVt(columns - 1, columns - 1) << endl << endl;
-    // ---------------------------------------------------------------
-    // Test codes (End)
-    // ---------------------------------------------------------------
-    
-    // Make the order of m_array_eigenvectors_out row-major
-    eigenvectors = eigenvectors.transpose().eval();
-    
-    cout << "--- solve_principal_component_analysis (END) ---" << endl;
-    cout << "--- C++ codes (END) ---" << endl;
 }

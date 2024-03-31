@@ -13,6 +13,13 @@
   <ItemGroup>
     <CudaCompile Include="PrincipalComponentAnalysisWithCuda.cu" />
   </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="PrincipalComponentAnalysis.cpp" />
+    <ClCompile Include="PrincipalComponentAnalysisWithEigen.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="PrincipalComponentAnalysis.h" />
+  </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{E4DAB080-0D38-4486-AE28-CFBCB660A034}</ProjectGuid>
     <RootNamespace>PrincipalComponentAnalysisWithCuda</RootNamespace>
@@ -83,11 +90,17 @@
       <OptimizeReferences>true</OptimizeReferences>
       <SubSystem>Console</SubSystem>
       <AdditionalDependencies>cusolver.lib;cublas.lib;cublasLt.lib;cusparse.lib;cusolverMg.lib;cudadevrt.lib;cudart_static.lib;kernel32.lib;user32.lib;gdi32.lib;winspool.lib;shell32.lib;ole32.lib;oleaut32.lib;uuid.lib;comdlg32.lib;advapi32.lib</AdditionalDependencies>
+      <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
     </Link>
     <CudaCompile>
       <TargetMachinePlatform>64</TargetMachinePlatform>
       <Include>
       </Include>
+      <CodeGeneration>compute_75,sm_75;</CodeGeneration>
+      <Optimization>InheritFromHost</Optimization>
+      <Runtime>MD</Runtime>
+      <AdditionalOptions>--extended-lambda %(AdditionalOptions)</AdditionalOptions>
+      <GenerateRelocatableDeviceCode>true</GenerateRelocatableDeviceCode>
     </CudaCompile>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

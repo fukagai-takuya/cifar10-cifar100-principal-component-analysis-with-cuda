@@ -4,6 +4,9 @@ namespace ConsoleCheckPcaWithCuda;
 
 internal class Program
 {
+    private const int CALCULATE_WITH_EIGEN = 0;
+    private const int CALCULATE_WITH_CUDA = 1;
+    
     static void Main(string[] args)
     {
         int rows = 100;
@@ -22,7 +25,7 @@ internal class Program
         }
 
         //
-        // Use Eigen (C++ library) and CUDA (cuSOLVER) to calculate PCA
+        // Use CUDA (cuBLAS, cuSOLVER) or Eigen (C++ library) to calculate PCA
         //
         double[] vectorMean = new double[columns];
         double[,] X_cov = new double[columns, columns];
@@ -43,8 +46,25 @@ internal class Program
                                                                        v_array_mean_out,
                                                                        m_array_cov_out,
                                                                        v_array_eigenvalues_out,
-                                                                       m_array_eigenvectors_out);
+                                                                       m_array_eigenvectors_out,
+                                                                       CALCULATE_WITH_CUDA);
             }
         }
+
+        Console.WriteLine($"vectorMean: {vectorMean[0]}, ..., {vectorMean[columns - 1]}");
+        Console.WriteLine("");
+            
+        Console.WriteLine($"X_cov: {X_cov[0, 0]}, ..., {X_cov[0, columns - 1]}");
+        Console.WriteLine("...");
+        Console.WriteLine($"X_cov: {X_cov[columns - 1, 0]}, ..., {X_cov[columns - 1, columns - 1]}");            
+        Console.WriteLine("");
+
+        Console.WriteLine($"vectorEigenvalues: {vectorEigenvalues[0]}, ..., {vectorEigenvalues[columns - 1]}");
+        Console.WriteLine("");
+            
+        Console.WriteLine($"matrixEigenvectors: {matrixEigenvectors[0, 0]}, ..., {matrixEigenvectors[0, columns - 1]}");
+        Console.WriteLine("...");
+        Console.WriteLine($"matrixEigenvectors: {matrixEigenvectors[columns - 1, 0]}, ..., {matrixEigenvectors[columns - 1, columns - 1]}");
+        Console.WriteLine("");
     }
 }

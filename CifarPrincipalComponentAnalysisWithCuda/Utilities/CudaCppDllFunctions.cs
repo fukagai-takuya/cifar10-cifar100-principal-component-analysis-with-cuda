@@ -12,5 +12,6 @@ internal static unsafe class CudaCppDllFunctions
                                                                  [Out] double* v_array_mean_out,
                                                                  [Out] double* m_array_cov_out,
                                                                  [Out] double* v_array_eigenvalues_out,
-                                                                 [Out] double* m_array_eigenvectors_out);
+                                                                 [Out] double* m_array_eigenvectors_out,
+                                                                 int calculation_method);
 }

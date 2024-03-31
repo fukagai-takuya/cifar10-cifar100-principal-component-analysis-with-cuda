@@ -1,5 +1,6 @@
 // #define CHECK_PCA
-#define USE_EIGEN_AND_CUDA
+#define PCA_WITH_CUDA
+//#define PCA_WITH_EIGEN
 
 using Accord.Math;
 using Accord.Math.Decompositions;
@@ -177,6 +178,9 @@ namespace CifarPrincipalComponentAnalysis.Models
         private double[,]? _matrixEigenvectors;
 
         private string _selectedPath = "";
+
+        private const int CALCULATE_WITH_EIGEN = 0;
+        private const int CALCULATE_WITH_CUDA = 1;
 
         public CifarDataset()
         {
@@ -476,9 +480,10 @@ namespace CifarPrincipalComponentAnalysis.Models
 
             double[,]? X_cov;
 
-#if USE_EIGEN_AND_CUDA
+#if PCA_WITH_CUDA
+            
             //
-            // Use Eigen (C++ library) and CUDA (cuSOLVER) to calculate PCA
+            // Use CUDA (cuBLAS and cuSOLVER) to calculate PCA
             //
             _vectorMean = new double[ImageDataSize];
             X_cov = new double[ImageDataSize, ImageDataSize];
@@ -499,10 +504,40 @@ namespace CifarPrincipalComponentAnalysis.Models
                                                                            v_array_mean_out,
                                                                            m_array_cov_out,
                                                                            v_array_eigenvalues_out,
-                                                                           m_array_eigenvectors_out);
+                                                                           m_array_eigenvectors_out,
+                                                                           CALCULATE_WITH_CUDA);
                 }
             }
-
+            
+#elif PCA_WITH_EIGEN
+            
+            //
+            // Use Eigen to calculate PCA
+            //
+            _vectorMean = new double[ImageDataSize];
+            X_cov = new double[ImageDataSize, ImageDataSize];
+            _vectorEigenvalues = new double[ImageDataSize];
+            _matrixEigenvectors = new double[ImageDataSize, ImageDataSize];
+            
+            unsafe
+            {
+                fixed (double* m_array_input = X_input,
+                       v_array_mean_out = _vectorMean,
+                       m_array_cov_out = X_cov,
+                       v_array_eigenvalues_out = _vectorEigenvalues,
+                       m_array_eigenvectors_out = _matrixEigenvectors)
+                {                        
+                    CudaCppDllFunctions.solve_principal_component_analysis(m_array_input,
+                                                                           numberOfImages,
+                                                                           ImageDataSize,
+                                                                           v_array_mean_out,
+                                                                           m_array_cov_out,
+                                                                           v_array_eigenvalues_out,
+                                                                           m_array_eigenvectors_out,
+                                                                           CALCULATE_WITH_EIGEN);
+                }
+            }
+            
 #else
             //
             // Use Accord to calculate PCA
