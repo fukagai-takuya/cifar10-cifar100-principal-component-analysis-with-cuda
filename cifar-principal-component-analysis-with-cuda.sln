@@ -7,7 +7,7 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "CifarPrincipalComponentAnal
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "PrincipalComponentAnalysisWithCuda", "PrincipalComponentAnalysisWithCuda\PrincipalComponentAnalysisWithCuda.vcxproj", "{E4DAB080-0D38-4486-AE28-CFBCB660A034}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ConsoleCheckPcaWithCuda", "ConsoleCheckPcaWithCuda\ConsoleCheckPcaWithCuda.csproj", "{A6F01967-8622-457C-AB69-44ECC60B53FC}"
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ConsoleCheckPcaWithCuda", "ConsoleCheckPcaWithCuda\ConsoleCheckPcaWithCuda.csproj", "{A6F01967-8622-457C-AB69-44ECC60B53FC}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution

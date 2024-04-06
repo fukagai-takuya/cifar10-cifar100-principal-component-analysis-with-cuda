@@ -1,8 +1,5 @@
 #include "PrincipalComponentAnalysis.h"
 
-using namespace std;
-using namespace Eigen;
-
 // CUDA API error checking
 #define CUDA_CHECK(err)                                                                            \
     do {                                                                                           \
